@@ -1,0 +1,535 @@
+//  -lm -lwiringPi -lpthread -lstdc++
+#include <iostream>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include "api/SeaBreezeWrapper.h"
+//#include <libgpsmm.h>
+#include <wiringPi.h>
+#include <wiringSerial.h>
+#include <string>
+#include <fstream>
+#include <cstring>
+#include <stdio.h> 
+#include <stdint.h> 
+#include <unistd.h>
+#include <fcntl.h> 
+#include <dlfcn.h>
+#include <sys/ioctl.h> 
+#include <linux/i2c.h> 
+#include <linux/i2c-dev.h>
+#include <math.h>
+#include <time.h>
+#include <pthread.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+//#include <termios.h>
+
+#define DEBUG
+
+#define WAIT_CMD_HEAD	0x1				//WAIT CMD HEAD
+#define WAIT_CMD_TYPE	0x2				//WAIT CMD TYPE
+#define WAIT_CMD_LENT	0x4				//WAIT CMD LENTH
+#define WAIT_CMD_DATA	0x8				//WAIT CMD DATA
+#define WAIT_CMD_TAIL	0x10			//WAIT CMD TAIL
+
+#define CMD_TYPE_UNDEF	0x0				//undefined CMD
+#define CMD_TYPE_PR		0x1				//PR CMD	rec&snd
+#define CMD_TYPE_ST		0x2				//ST CMD	rec
+#define CMD_TYPE_BG		0x4				//BG CMD	rec
+#define CMD_TYPE_TD		0x8				//TD CMD	rec&snd
+#define CMD_TYPE_ED		0x10			//ED CMD	rec
+#define CMD_TYPE_RT		0x20			//RT CMD	rec&snd
+#define CMD_TYPE_RQ		0x40			//RQ CMD	snd
+#define CMD_TYPE_ALL	0xFFFFFFFF		//all CMD mask
+
+#define RECIEVE_INTERVAL	100			//recieve interval time in ms when no data come from serial
+#define REC_CMD_DATA_MAX	80			//max CMD's data, data size any CMD take should not bigger than this macro
+#define SEND_BUF_MAX_SIZE	(5*1024)	//max size one CMD send
+
+struct CMDdata_t    
+{    
+   uint datalen;    
+   char data[REC_CMD_DATA_MAX];     
+};
+struct MSG_t
+{    
+   long msgtype;						//use msgtype to transfer CMD type
+   struct CMDdata_t cmddata;
+};
+
+using namespace std;
+
+int fd;									//for ttyAMA0 read/write.
+uint msgkey = 300;						//random number
+struct MSG_t rcvmsg;
+
+const char* get_error_string(int error) {
+    static char buffer[32];
+    seabreeze_get_error_string(error, buffer, sizeof(buffer));
+    return buffer;
+}
+
+
+
+
+
+char* systemtime(char *s)  //获取系统时间
+{
+	/*------------------------获取系统时间------------------------*/
+	time_t timep;
+	struct tm *tmp_ptr = NULL;
+	time(&timep);
+	tmp_ptr = localtime(&timep);
+	cout << dec << "Day" << 1 + tmp_ptr->tm_mon << "-" << tmp_ptr->tm_mday << "Time" << tmp_ptr->tm_hour << ":" << tmp_ptr->tm_min << ":" << tmp_ptr->tm_sec << endl;
+	/*------------------------获取系统时间------------------------*/
+	return s;
+}
+
+int serialDataAvail_ext()
+{
+	int data_avail = 0;
+	if (fd > 0)
+	{
+		data_avail = serialDataAvail(fd);
+		if (data_avail < 0)
+		{
+			cout << "serialDataAvail return -1, error condition" << endl;
+		}
+#ifdef DEBUG
+		if (data_avail > 1)
+			cout << data_avail <<" byte data available in serial driver." << endl;
+#endif
+	}
+	return data_avail;
+}
+
+//return effective msg type got, -1 on error 
+int process_msg(uint msg_type_mask) 
+{
+	int ret = -1;
+	//int data_avail = 0;
+	//uint CMD_state = WAIT_CMD_HEAD;
+	//char ser_data = 0;
+	//uint CMD_lenth = 0;
+	//uint CMD_type = 0;  
+	int msqid_here = 0;
+	
+	msqid_here = msgget(msgkey, IPC_EXCL);
+	if (msqid_here < 0)
+	{
+		cout << "msg queue not existed!" <<endl;
+	}
+	else
+	{
+#ifdef DEBUG
+		cout << dec << "msqid_here = " << msqid_here <<endl;	
+#endif
+		while(1)
+		{
+			ret = msgrcv(msqid_here, &rcvmsg, sizeof(struct MSG_t),0,0);		//use block method to get msg
+			if(ret < 0)
+			{
+				cout << "msgrcv failed, errno = " << strerror (errno) <<endl;
+				break;
+			}
+			else if((rcvmsg.msgtype & msg_type_mask) == 0)
+			{
+				//msg type is not correct, discard
+				cout << "discard msg = " << rcvmsg.msgtype <<endl;
+				continue;
+			}
+			else
+			{
+				ret = rcvmsg.msgtype;
+				break;
+			}
+		}
+	}
+	
+	return ret;
+}
+
+int sendCMD(uint cmdtype)
+{
+	//need send to serial driver
+	uint CMD_size = 0;
+	char buffer[SEND_BUF_MAX_SIZE];
+	
+	buffer[CMD_size++] = '$';								//CMD head
+	switch(cmdtype)
+	{
+		case CMD_TYPE_PR:
+			buffer[CMD_size++] = 'P';						//2 byte for CMD type
+			buffer[CMD_size++] = 'R';
+			buffer[CMD_size++] = 0;							//2 byte for CMD lenth
+			buffer[CMD_size++] = 0;
+			break;
+		case CMD_TYPE_RT:
+			buffer[CMD_size++] = 'R';						//2 byte for CMD type
+			buffer[CMD_size++] = 'T';
+			buffer[CMD_size++] = 0;							//2 byte for CMD lenth
+			buffer[CMD_size++] = 0;
+			break;
+		case CMD_TYPE_RQ:
+			buffer[CMD_size++] = 'R';						//2 byte for CMD type
+			buffer[CMD_size++] = 'Q';
+			buffer[CMD_size++] = 0;							//2 byte for CMD lenth
+			buffer[CMD_size++] = 0;
+			break;
+		case CMD_TYPE_TD:
+			buffer[CMD_size++] = 'T';						//2 byte for CMD type
+			buffer[CMD_size++] = 'D';
+			buffer[CMD_size++] = 0;							//2 byte for CMD lenth
+			buffer[CMD_size++] = 0;
+			//need CMD data
+			break;
+		default:
+			break;
+	}
+	buffer[CMD_size++] = '#';								//CMD tail
+	
+	if(CMD_size > SEND_BUF_MAX_SIZE)
+	{
+		cout << "CMD_size is bigger than max." << CMD_size <<endl;
+		return -1;
+	}
+	
+	for(uint i = 0; i < CMD_size; i++)
+	{
+		serialPutchar(fd, buffer[i]);
+	}
+	
+	return 0;
+}
+
+int data_collect()
+{
+	int CMD_type = CMD_TYPE_UNDEF;							//CMD type of msg just take from msg queue
+	uint CMD_status = CMD_TYPE_UNDEF;						//CMD type just been processed.
+	uint CMD_mask = CMD_TYPE_PR;							//CMDs type mask
+	
+	while(1)
+	{
+		CMD_type = process_msg(CMD_mask);
+		if(CMD_type <= 0)
+		{
+			cout << "msg queue is not ready!" <<endl;
+			delay(200);										//wait for msg queue ready and 
+			continue;
+		}
+		
+		if(CMD_type == CMD_TYPE_PR)
+		{
+			//do something?
+			
+			sendCMD(CMD_TYPE_PR);
+			CMD_status = CMD_TYPE_PR;
+			CMD_mask = CMD_TYPE_PR | CMD_TYPE_ST;
+			continue;
+		}
+		
+		if(CMD_type == CMD_TYPE_ED)
+		{
+			CMD_status = CMD_TYPE_UNDEF;
+			CMD_mask = CMD_TYPE_PR;
+			continue;
+		}
+		
+		switch(CMD_status)
+		{
+			case CMD_TYPE_PR:
+				if(CMD_type == CMD_TYPE_ST)
+				{
+					//need analyze CMD data in msg for setting
+					
+					sendCMD(CMD_TYPE_RT);
+					CMD_status = CMD_TYPE_ST;
+					CMD_mask = CMD_TYPE_PR | CMD_TYPE_BG | CMD_TYPE_ED;
+				}
+				break;
+			case CMD_TYPE_ST:
+				if(CMD_type == CMD_TYPE_BG)
+				{
+					//need analyze CMD data in msg for file name
+					
+					sendCMD(CMD_TYPE_RQ);
+					CMD_status = CMD_TYPE_BG;
+					CMD_mask = CMD_TYPE_PR | CMD_TYPE_TD | CMD_TYPE_ED;	
+				}
+				break;
+			case CMD_TYPE_BG:
+				if(CMD_type == CMD_TYPE_TD)
+				{
+					//need analyze CMD data in msg for GPS etc.
+					
+					//need prepare .csv
+					
+					//need compress
+					
+					sendCMD(CMD_TYPE_TD);
+					CMD_status = CMD_TYPE_BG;
+					CMD_mask = CMD_TYPE_PR | CMD_TYPE_TD | CMD_TYPE_ED;	
+					//need delay some time, 1000ms?
+					delay(500);
+					sendCMD(CMD_TYPE_RQ);
+				}
+				break;
+			default:
+				break;
+		}
+	}
+	return 0;
+}
+
+void *recieve_thread(void *arg)
+{
+	int ret = 0;
+	int data_avail = 0;
+	uint CMD_state = WAIT_CMD_HEAD;
+	char ser_data = 0;
+	uint CMD_lenth = 0;
+	uint CMD_type = CMD_TYPE_UNDEF;
+	uint trytimes = 100;									//try times to create new msg queue successfully   
+	int msqid = 0;
+	struct MSG_t sendmsg;
+	
+	//detach to release memory when thread exit.
+	if ((ret=pthread_detach(pthread_self())) != 0)
+	{   
+		cout << "pthread_detach:" << strerror(ret) <<endl;
+		cout << "Unable to detach recieve_thread" <<endl ;
+	}
+	
+#ifdef DEBUG
+	cout << "recieve_thread PID:" << getpid() <<endl;
+	cout << "recieve_thread TID:" << pthread_self() <<endl;
+#endif
+
+	//prepare msg queue
+	while(trytimes--)
+	{
+		msqid = msgget(msgkey,IPC_CREAT|IPC_EXCL|0666);
+		if (msqid < 0)
+		{
+			msgkey++;
+			cout << "msgget return -1, increase and retry." <<endl;
+			continue;
+		}
+		cout << "msqid = " << msqid <<endl;
+		break;
+	}
+	if (msqid < 0)
+	{
+		return((void*)0);
+	}
+	
+	while(1)
+	{
+		data_avail = serialDataAvail_ext();
+		if (data_avail <= 0)
+		{
+			delay(RECIEVE_INTERVAL);
+			continue;
+		}
+		switch (CMD_state)
+		{
+			case WAIT_CMD_HEAD:
+				ser_data = serialGetchar(fd);				//one byte '$' for CMD head 
+				if (ser_data == '$')
+				{
+					CMD_state = WAIT_CMD_TYPE;
+				}
+				break;
+			case WAIT_CMD_TYPE:
+				if (data_avail > 1)							//2 byte for CMD type
+				{
+					ser_data = serialGetchar(fd);
+					switch (ser_data)
+					{
+						case 'P':
+							ser_data = serialGetchar(fd);
+							if (ser_data == 'R')
+							{
+#ifdef DEBUG
+								cout << "get PR CMD from serial driver." << endl;
+#endif
+								CMD_state = WAIT_CMD_LENT;
+								CMD_type = CMD_TYPE_PR;
+							}
+						break;
+						case 'S':
+							ser_data = serialGetchar(fd);
+							if (ser_data == 'T')
+							{
+#ifdef DEBUG
+								cout << "get ST CMD from serial driver." << endl;
+#endif
+								CMD_state = WAIT_CMD_LENT;
+								CMD_type = CMD_TYPE_ST;
+							}
+						break;
+						case 'B':
+							ser_data = serialGetchar(fd);
+							if (ser_data == 'G')
+							{
+#ifdef DEBUG
+								cout << "get BG CMD from serial driver." << endl;
+#endif
+								CMD_state = WAIT_CMD_LENT;
+								CMD_type = CMD_TYPE_BG;
+							}
+						break;
+						case 'T':
+							ser_data = serialGetchar(fd);
+							if (ser_data == 'D')
+							{
+#ifdef DEBUG
+								cout << "get TD CMD from serial driver." << endl;
+#endif
+								CMD_state = WAIT_CMD_LENT;
+								CMD_type = CMD_TYPE_TD;
+							}
+						break;
+						case 'E':
+							ser_data = serialGetchar(fd);
+							if (ser_data == 'D')
+							{
+#ifdef DEBUG
+								cout << "get ED CMD from serial driver." << endl;
+#endif
+								CMD_state = WAIT_CMD_LENT;
+								CMD_type = CMD_TYPE_ED;
+							}
+						break;
+						case 'R':
+							ser_data = serialGetchar(fd);
+							if (ser_data == 'T')
+							{
+#ifdef DEBUG
+								cout << "get RT CMD from serial driver." << endl;
+#endif
+								CMD_state = WAIT_CMD_LENT;
+								CMD_type = CMD_TYPE_RT;
+							}
+						break;
+						default:
+						break;
+					}
+					//undefined CMD, transfer to WAIT_CDM_HEAD state
+					if (CMD_type == CMD_TYPE_UNDEF)
+					{
+						CMD_state = WAIT_CMD_HEAD;
+					}
+					else
+					{
+						sendmsg.msgtype = CMD_type;
+					}
+				}
+				break;
+			case WAIT_CMD_LENT:
+				if (data_avail > 1)							//2 byte for CMD lenth 
+				{
+					CMD_lenth = 0;
+					ser_data = serialGetchar(fd);
+					CMD_lenth = ser_data;
+					ser_data = serialGetchar(fd);
+					CMD_lenth += (ser_data * 256);
+#ifdef DEBUG
+					cout << "get CMD lenth = " << CMD_lenth << " from serial driver." <<endl;
+#endif
+					if (CMD_lenth > REC_CMD_DATA_MAX)		//judge CMD data lenth legal
+					{
+						CMD_state = WAIT_CMD_HEAD;
+					}
+					else
+					{
+						sendmsg.cmddata.datalen = CMD_lenth;
+						if(CMD_lenth == 0)
+						{
+							CMD_state = WAIT_CMD_TAIL;
+						}
+						else
+						{
+							CMD_state = WAIT_CMD_DATA;
+						}
+					}
+				}
+				break;
+			case WAIT_CMD_DATA:
+				//need test serial driver to confirm max recieve buffer size.
+				if ((uint)data_avail >= CMD_lenth)			//CMD_lenth data to be read
+				{
+					//sendmsg.cmddata.datalen = CMD_lenth;
+					for (uint i = 0; i < CMD_lenth; i++)
+					{
+						ser_data = serialGetchar(fd);
+#ifdef DEBUG
+						cout << hex << "get data " << ser_data << endl;
+#endif
+						sendmsg.cmddata.data[i] = ser_data;
+					}					
+					CMD_state = WAIT_CMD_TAIL;
+				}
+				break;
+			case WAIT_CMD_TAIL:
+				ser_data = serialGetchar(fd);				//one byte '$' for CMD head 
+				if (ser_data == '#')
+				{
+					//got correct CMD now, and send msg
+					ret = msgsnd(msqid, &sendmsg, sizeof(struct MSG_t), 0);
+					if (ret < 0)
+					{
+						cout << "msgsnd failed, errno = " << strerror (errno) <<endl;
+					}
+				}
+				CMD_state = WAIT_CMD_HEAD;			
+				break;
+			default:
+				break;
+		}
+	}
+
+    return((void*)0);
+}
+
+int main()
+{
+	int ret = 0;
+    pthread_t t1;
+	int msqid = 0;
+	
+    wiringPiSetup();                   						//wiringPi初始化树莓派
+
+	delay(10);
+	
+	if ((fd = serialOpen ("/dev/ttyAMA0", 115200)) < 0)
+	{
+		cout << "Unable to open serial device: " << strerror (errno) <<endl ;
+		return 1;
+	}
+	if ((ret=pthread_create(&t1, NULL, recieve_thread, NULL)) != 0)
+	{   
+		cout << "pthread_create:" << strerror(ret) <<endl;
+		cout << "Unable to create recieve_thread" <<endl ;
+		return 1;
+	}
+	delay(100);												//wait for recieve_thread run
+
+	data_collect();											//main process
+
+	//clean up and exit main:
+	msqid = msgget(msgkey, IPC_EXCL);
+	if(msgctl(msqid, IPC_RMID, 0) == -1)
+	{
+		cout << "remove msg queue return error" <<endl;
+	}
+	
+	pthread_join(t1, NULL);
+	serialFlush(fd);
+	serialClose(fd);
+
+    seabreeze_shutdown();
+    return 0;
+}
